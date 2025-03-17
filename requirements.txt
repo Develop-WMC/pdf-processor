@@ -1,0 +1,8 @@
+streamlit
+PyPDF2
+PyMuPDF
+Pillow
+google-generativeai
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
