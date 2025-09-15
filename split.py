@@ -9,24 +9,25 @@ import io
 from datetime import datetime
 import re
 
-# --- Configuration ---
-# It's recommended to set your API key as an environment variable
-# or using Streamlit's secrets management.
-# For demonstration, we'll use st.text_input, but this is not secure for production.
-st.set_page_config(layout="wide")
+# --- Page Configuration ---
+st.set_page_config(layout="wide", page_title="PDF Processing System")
 
+# --- Main App Title ---
 st.title("PDF Processing & Email System")
 
-# Securely get the API key
-api_key = st.text_input("Enter your Google Gemini API Key", type="password")
-if api_key:
-    try:
-        genai.configure(api_key=api_key)
-    except Exception as e:
-        st.error(f"Failed to configure Gemini API: {e}")
-        st.stop()
-else:
-    st.warning("Please enter your Google Gemini API Key to proceed.")
+# --- API Key Input ---
+# Using secrets for production is highly recommended.
+# For this example, we use a password input field for the API key.
+api_key = st.text_input("Enter your Google Gemini API Key to begin", type="password")
+
+if not api_key:
+    st.warning("The application requires a Google Gemini API Key to function.")
+    st.stop()
+
+try:
+    genai.configure(api_key=api_key)
+except Exception as e:
+    st.error(f"Failed to configure the Gemini API. Please check your key. Error: {e}")
     st.stop()
 
 
@@ -43,100 +44,75 @@ os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 # --- Core Functions ---
 
 def sanitize_filename(filename):
-    """Removes characters that are invalid for filenames."""
-    invalid_chars = r'[<>:"/\\|?*]'
-    return re.sub(invalid_chars, '_', filename)
+    """Removes invalid characters from a string to make it a valid filename."""
+    return re.sub(r'[<>:"/\\|?*]', '_', filename)
 
 def get_gemini_response(image):
     """
-    Sends an image of a PDF page to the Gemini model and asks it to extract
-    specific information in a JSON format.
+    Sends a PDF page image to the Gemini model and robustly parses the JSON response.
+    This function is now designed to handle both JSON objects and arrays gracefully.
     """
     try:
-        # Using a more recent and capable model is recommended
         model = genai.GenerativeModel('gemini-pro-vision')
-        
-        prompt = """From the document image, extract the following information.
-        The document is a fund house settlement report. Each page represents a settlement for a fund house, except for continuation or summary pages.
+        prompt = """Analyze the document image. Your goal is to extract specific fields.
+        The document is a fund house settlement report.
 
-        1.  **Fund Hse Settlement Inst**: Find the text following "Fund Hse Settlement Inst :".
-            - If it contains a dash ('-'), take only the part BEFORE the first dash.
-            - Special Cases (use the name after the arrow):
-              - "ICBC(Asia) Trustee Company Limited - GaoTeng" -> "GaoTeng"
-              - "State Street Fund Services (Ireland) Limited - Barings" -> "Barings"
-              - "UI efa S.A. - Nevastar" -> "Nevastar"
-              - "MFEX - BlackRock" -> "MFEX"
+        - If the page is a primary settlement page, find these fields:
+          1.  "Fund Hse Settlement Inst :": Extract the text. If it contains a dash ('-'), use only the part BEFORE the first dash (e.g., "State Street Fund Services (Ireland) Limited - Barings" -> "Barings"). Special Case: "MFEX - BlackRock" -> "MFEX".
+          2.  "Currency :": Extract the 3-letter currency code (e.g., USD).
+          3.  "Payment Group ... Total": Extract the final numerical total for the payment group.
 
-        2.  **Currency**: Find the 3-letter code following "Currency :".
+        - If the page is a continuation page, summary page, or does not contain these specific fields, you do not need to find them.
 
-        3.  **Payment Group Total**: Find the numerical value following "Payment Group [ID] Total".
-
-        If you cannot find these fields (e.g., on a continuation or summary page), return an empty JSON object.
-
-        RETURN A JSON OBJECT. Your response must be only the JSON, like this:
-        {
-            "simplified_name": "Extracted and simplified name",
-            "currency": "e.g., USD",
-            "payment_total": "e.g., 31510.97"
-        }
+        **RESPONSE FORMAT**:
+        - For primary settlement pages, RETURN ONLY A JSON OBJECT like this:
+          {"simplified_name": "Barings", "currency": "AUD", "payment_total": "10551.97"}
+        - For all other pages (continuation, summary, etc.), RETURN AN EMPTY JSON OBJECT:
+          {}
         """
-
         response = model.generate_content([prompt, image])
         
-        # Robustly extract JSON from the response text
+        # --- ROBUST JSON EXTRACTION (FIXED) ---
         json_str = response.text
-        match = re.search(r"```(json)?\s*(\{.*?\})\s*```", json_str, re.DOTALL)
+        # Use regex to find a JSON object within markdown ```json ... ``` or just in the text.
+        match = re.search(r"\{.*\}", json_str, re.DOTALL)
+        
         if match:
-            json_str = match.group(2)
+            # We found a JSON object.
+            return json.loads(match.group(0))
         else:
-            # Fallback for cases where markdown is not used but JSON is present
-            json_str = json_str[json_str.find('{'):json_str.rfind('}')+1]
+            # If no JSON object is found, it's likely a continuation page or an error.
+            # Return an empty dictionary to signal this.
+            return {}
 
-        # Return None if the cleaned string is empty or not valid JSON
-        if not json_str.strip():
-             return {} # Return an empty dict if no JSON is found
-
-        return json.loads(json_str.strip())
-
+    except json.JSONDecodeError:
+        st.warning("AI returned malformed JSON. The page will be skipped.")
+        return {} # Return empty dict on JSON parsing failure
     except Exception as e:
         st.error(f"An error occurred with the AI model: {str(e)}")
-        return None
+        return None # Return None for other critical errors
 
 def convert_pdf_to_image(pdf_path, page_num):
-    """Converts a single page of a PDF into a high-resolution PIL Image."""
+    """Converts a single PDF page to a high-resolution PIL Image for analysis."""
     try:
         doc = fitz.open(pdf_path)
-        if page_num >= len(doc):
-            return None
+        if page_num >= len(doc): return None
         page = doc[page_num]
-        zoom = 4  # Increase zoom for better OCR quality
+        # Use high zoom for better OCR quality by the AI model
+        zoom = 4.0
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat, alpha=False)
         img_data = pix.tobytes("png")
         doc.close()
         return Image.open(io.BytesIO(img_data))
     except Exception as e:
-        st.error(f"Error converting PDF page to image: {str(e)}")
+        st.error(f"Error converting PDF page {page_num + 1} to image: {str(e)}")
         return None
-
-def is_continuation_or_summary_page(page_text):
-    """
-    Checks if a page is a summary or a continuation page that should be skipped.
-    """
-    # Summary pages often have "Summary" and totals for multiple currencies
-    if "Summary" in page_text and "Payment Group" not in page_text:
-        return True
-    
-    # Continuation pages lack the main header but might have the footer
-    if "Fund House :" not in page_text and "WMC Nominees Ltd" in page_text:
-        return True
-        
-    return False
 
 def process_pdf(uploaded_file, start_sequence, progress_bar, status_area):
     """
-    Main processing function. Iterates through a PDF, extracts data from each page,
-    and creates individual PDF files for each valid settlement.
+    Main processing loop. Iterates through PDF pages, calls the AI, and creates
+    individual PDF files. Now includes robust error checking.
     """
     generated_files = []
     temp_path = None
@@ -151,126 +127,110 @@ def process_pdf(uploaded_file, start_sequence, progress_bar, status_area):
         sequence_number = start_sequence
 
         for page_number in range(total_pages):
-            progress = (page_number + 1) / total_pages
             status_text = f"Processing page {page_number + 1} of {total_pages}"
-            progress_bar.progress(progress, status_text)
+            progress_bar.progress((page_number + 1) / total_pages, text=status_text)
             status_area.text(status_text)
-            
-            # Check if page should be skipped early
-            page_text = reader.pages[page_number].extract_text()
-            if is_continuation_or_summary_page(page_text):
-                status_area.info(f"Page {page_number + 1} identified as a summary/continuation page. Skipping.")
-                continue
 
-            # Convert page to image for AI processing
             page_image = convert_pdf_to_image(temp_path, page_number)
             if not page_image:
-                status_area.warning(f"Could not convert page {page_number + 1} to an image. Skipping.")
+                status_area.warning(f"Could not convert page {page_number + 1}. Skipping.")
                 continue
 
             ai_results = get_gemini_response(page_image)
 
-            if ai_results:
-                # ======================= FIX APPLIED HERE =======================
-                # The original error was "'list' object has no attribute 'get'".
-                # This check ensures we only proceed if the AI returns a dictionary,
-                # not a list or another data type.
-                if not isinstance(ai_results, dict):
-                    status_area.warning(f"Unexpected data format received from AI for page {page_number + 1}. Skipping.")
-                    continue
-                # ================================================================
+            # --- ROBUST CHECKING (FIXED) ---
+            # This is the critical check. We ensure the result is a dictionary AND not empty.
+            # This correctly handles the error `'list' object has no attribute 'get'`
+            # by skipping pages where the AI returns a list, None, or an empty dict.
+            if not isinstance(ai_results, dict) or not ai_results:
+                status_area.info(f"Page {page_number + 1} is a continuation/summary page or lacks data. Skipping.")
+                continue
 
-                chosen_name = ai_results.get("simplified_name")
-                currency = ai_results.get("currency")
-                payment_total = ai_results.get("payment_total")
+            chosen_name = ai_results.get("simplified_name")
+            currency = ai_results.get("currency")
+            payment_total = ai_results.get("payment_total")
 
-                # Proceed only if all required fields were extracted
-                if chosen_name and currency and payment_total:
-                    date_str = datetime.now().strftime('%y%m%d')
-                    sanitized_name = sanitize_filename(chosen_name)
-                    filename = f"S{date_str}-{str(sequence_number).zfill(2)}_{sanitized_name}_{currency}-order details.pdf"
-                    output_path = os.path.join(OUTPUT_FOLDER, filename)
+            if chosen_name and currency and payment_total:
+                date_str = datetime.now().strftime('%y%m%d')
+                sanitized_name = sanitize_filename(chosen_name)
+                filename = f"S{date_str}-{str(sequence_number).zfill(2)}_{sanitized_name}_{currency}-order details.pdf"
+                output_path = os.path.join(OUTPUT_FOLDER, filename)
 
-                    # Create a new PDF with just the current page
-                    pdf_writer = PdfWriter()
-                    pdf_writer.add_page(reader.pages[page_number])
-                    
-                    with open(output_path, 'wb') as output_file:
-                        pdf_writer.write(output_file)
+                pdf_writer = PdfWriter()
+                pdf_writer.add_page(reader.pages[page_number])
+                
+                with open(output_path, 'wb') as output_file:
+                    pdf_writer.write(output_file)
 
-                    # Read the content of the newly created file for download
-                    with open(output_path, 'rb') as file:
-                        file_content = file.read()
-                        generated_files.append({
-                            'filename': filename,
-                            'content': file_content,
-                            'currency': currency,
-                            'payment_total': float(str(payment_total).replace(',', ''))
-                        })
-                    
-                    status_area.success(f"Successfully processed page {page_number + 1} -> {filename}")
-                    sequence_number += 1
-                else:
-                    status_area.info(f"Page {page_number + 1} did not contain all required data (Name, Currency, Total). Skipping.")
+                with open(output_path, 'rb') as file:
+                    file_content = file.read()
+                    generated_files.append({
+                        'filename': filename,
+                        'content': file_content,
+                    })
+                
+                status_area.success(f"✓ Generated file for page {page_number + 1}: {filename}")
+                sequence_number += 1
+            else:
+                status_area.info(f"Page {page_number + 1} was analyzed but didn't contain all required fields. Skipping.")
 
-        progress_bar.empty()
         status_area.success("Processing complete!")
         return generated_files, sequence_number
 
     except Exception as e:
-        st.error(f"A critical error occurred during PDF processing: {str(e)}")
+        # This will now catch any other unexpected errors during the process
+        st.error(f"A critical error occurred: {str(e)}")
         return [], start_sequence
     finally:
-        # Clean up the temporary file
         if temp_path and os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
-            except Exception as e:
-                st.warning(f"Could not remove temporary file: {str(e)}")
+            except OSError as e:
+                st.warning(f"Could not remove temporary file: {e}")
 
 
 # --- Streamlit UI Layout ---
 
 st.header("1. PDF Processing")
 
-col1, col2 = st.columns([1, 4])
+col1, col2 = st.columns()
 with col1:
-    last_sequence = st.number_input("Last sequence number used:", min_value=0, value=0, step=1)
+    last_sequence = st.number_input("Last sequence number used:", min_value=0, value=0, step=1, key="seq_num")
 
 uploaded_file = st.file_uploader(
     "Upload PDF",
     type="pdf",
-    help="Drag and drop or browse for your settlement PDF file."
+    help="Drag and drop your settlement PDF file (limit 200MB)."
 )
 
 if uploaded_file:
-    st.info(f"Uploaded: `{uploaded_file.name}` ({uploaded_file.size / 1024:.1f} KB)")
+    st.info(f"File ready: `{uploaded_file.name}`")
 
-    if st.button("Process PDF and Create Email Drafts"):
+    if st.button("Process PDF and Create Email Drafts", type="primary"):
         st.session_state.processed_files = []
-        progress_bar = st.progress(0, "Starting processing...")
-        status_area = st.empty()
-
-        with st.spinner('Processing PDF... This may take a few moments.'):
+        progress_bar = st.progress(0, "Initializing...")
+        # Use an expander for detailed logs
+        with st.expander("Processing Log", expanded=True):
+            status_area = st.empty()
+            status_area.text("Starting PDF processing...")
             processed_results, next_sequence = process_pdf(uploaded_file, last_sequence + 1, progress_bar, status_area)
-            if processed_results:
-                st.session_state.processed_files = processed_results
-                st.success(f"Successfully processed the PDF and generated {len(processed_results)} files.")
-                st.info(f"The next sequence number to use is: **{next_sequence}**")
-            else:
-                st.error("No valid settlement pages could be processed from the PDF.")
         
-        # Clear progress bar and status text after completion
-        progress_bar.empty()
-        status_area.empty()
+        progress_bar.empty() # Clear progress bar on completion
 
+        if processed_results:
+            st.session_state.processed_files = processed_results
+            st.success(f"**Processing finished. {len(processed_results)} files were generated.**")
+            st.info(f"The next sequence number should be: **{next_sequence}**")
+        else:
+            st.error("No valid settlement pages were found to generate files.")
 
+# --- Display Generated Files for Download ---
 if st.session_state.processed_files:
     st.header("2. Generated Files")
-    st.write("Download the generated PDF files below.")
+    st.markdown("---")
     for item in st.session_state.processed_files:
         st.download_button(
-            label=f"⬇️ Download {item['filename']}",
+            label=f"⬇️ Download: {item['filename']}",
             data=item['content'],
             file_name=item['filename'],
             mime='application/pdf'
