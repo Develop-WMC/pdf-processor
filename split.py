@@ -15,19 +15,15 @@ st.set_page_config(layout="wide", page_title="PDF Processing System")
 # --- Main App Title ---
 st.title("PDF Processing & Email System")
 
-# --- API Key Input ---
-# Using secrets for production is highly recommended.
-# For this example, we use a password input field for the API key.
-api_key = st.text_input("Enter your Google Gemini API Key to begin", type="password")
-
-if not api_key:
-    st.warning("The application requires a Google Gemini API Key to function.")
-    st.stop()
-
+# --- API Key Configuration (The Correct, Secure Way) ---
+# This securely accesses the API key from Streamlit's secrets management.
+# Ensure you have a GOOGLE_API_KEY="your_key_here" in your secrets.toml file
+# or in the app settings on Streamlit Community Cloud.
 try:
-    genai.configure(api_key=api_key)
-except Exception as e:
-    st.error(f"Failed to configure the Gemini API. Please check your key. Error: {e}")
+    genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+except (KeyError, AttributeError):
+    st.error("API Key not found. Please add your Google Gemini API Key to your Streamlit secrets.")
+    st.info("Add a secret like this: `GOOGLE_API_KEY = 'YOUR_API_KEY_HERE'`")
     st.stop()
 
 
@@ -74,15 +70,11 @@ def get_gemini_response(image):
         
         # --- ROBUST JSON EXTRACTION (FIXED) ---
         json_str = response.text
-        # Use regex to find a JSON object within markdown ```json ... ``` or just in the text.
         match = re.search(r"\{.*\}", json_str, re.DOTALL)
         
         if match:
-            # We found a JSON object.
             return json.loads(match.group(0))
         else:
-            # If no JSON object is found, it's likely a continuation page or an error.
-            # Return an empty dictionary to signal this.
             return {}
 
     except json.JSONDecodeError:
@@ -98,7 +90,6 @@ def convert_pdf_to_image(pdf_path, page_num):
         doc = fitz.open(pdf_path)
         if page_num >= len(doc): return None
         page = doc[page_num]
-        # Use high zoom for better OCR quality by the AI model
         zoom = 4.0
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat, alpha=False)
@@ -112,7 +103,7 @@ def convert_pdf_to_image(pdf_path, page_num):
 def process_pdf(uploaded_file, start_sequence, progress_bar, status_area):
     """
     Main processing loop. Iterates through PDF pages, calls the AI, and creates
-    individual PDF files. Now includes robust error checking.
+    individual PDF files. Includes robust error checking.
     """
     generated_files = []
     temp_path = None
@@ -139,9 +130,8 @@ def process_pdf(uploaded_file, start_sequence, progress_bar, status_area):
             ai_results = get_gemini_response(page_image)
 
             # --- ROBUST CHECKING (FIXED) ---
-            # This is the critical check. We ensure the result is a dictionary AND not empty.
-            # This correctly handles the error `'list' object has no attribute 'get'`
-            # by skipping pages where the AI returns a list, None, or an empty dict.
+            # This check ensures the result is a non-empty dictionary, which correctly
+            # handles the original "'list' object has no attribute 'get'" error.
             if not isinstance(ai_results, dict) or not ai_results:
                 status_area.info(f"Page {page_number + 1} is a continuation/summary page or lacks data. Skipping.")
                 continue
@@ -178,7 +168,6 @@ def process_pdf(uploaded_file, start_sequence, progress_bar, status_area):
         return generated_files, sequence_number
 
     except Exception as e:
-        # This will now catch any other unexpected errors during the process
         st.error(f"A critical error occurred: {str(e)}")
         return [], start_sequence
     finally:
@@ -193,7 +182,7 @@ def process_pdf(uploaded_file, start_sequence, progress_bar, status_area):
 
 st.header("1. PDF Processing")
 
-col1, col2 = st.columns()
+col1, col2 = st.columns([1, 4])
 with col1:
     last_sequence = st.number_input("Last sequence number used:", min_value=0, value=0, step=1, key="seq_num")
 
@@ -209,13 +198,12 @@ if uploaded_file:
     if st.button("Process PDF and Create Email Drafts", type="primary"):
         st.session_state.processed_files = []
         progress_bar = st.progress(0, "Initializing...")
-        # Use an expander for detailed logs
         with st.expander("Processing Log", expanded=True):
             status_area = st.empty()
             status_area.text("Starting PDF processing...")
             processed_results, next_sequence = process_pdf(uploaded_file, last_sequence + 1, progress_bar, status_area)
         
-        progress_bar.empty() # Clear progress bar on completion
+        progress_bar.empty()
 
         if processed_results:
             st.session_state.processed_files = processed_results
