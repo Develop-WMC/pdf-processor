@@ -6,6 +6,8 @@ from email_draft import get_gmail_service, create_settlement_template, create_dr
 import google.generativeai as genai
 import zipfile
 from io import BytesIO
+import hashlib
+
 
 def initialize_app():
     """Initialize the application settings and directories"""
@@ -19,6 +21,7 @@ def initialize_app():
     # Configure Gemini API
     genai.configure(api_key=st.secrets["pdf_processor"]["api_key"])
 
+
 def create_zip_file(files):
     """Create a ZIP file containing the provided files"""
     zip_buffer = BytesIO()
@@ -27,6 +30,16 @@ def create_zip_file(files):
             zip_file.writestr(file_info['filename'], file_info['content'])
     return zip_buffer.getvalue()
 
+
+def stable_id(*parts: str) -> str:
+    """
+    Create a short stable key from any set of parts.
+    Ensures keys are valid and unique across reruns.
+    """
+    joined = "||".join(str(p) for p in parts)
+    return hashlib.sha1(joined.encode("utf-8")).hexdigest()[:10]
+
+
 def main():
     st.title("PDF Processing & Email System")
     initialize_app()
@@ -34,21 +47,24 @@ def main():
     # PDF Processing Section
     st.header("1. PDF Processing")
 
-    # Sequence Number Input
+    # Sequence Number Input (give explicit key)
     last_sequence = st.number_input(
         "Last sequence number used:",
         min_value=0,
         value=0,
-        step=1
+        step=1,
+        key="last_sequence_input",
     )
     start_sequence = last_sequence + 1 if last_sequence > 0 else 1
 
-    # File Upload
-    uploaded_file = st.file_uploader("Upload PDF", type=['pdf'])
+    # File Upload (explicit key)
+    uploaded_file = st.file_uploader("Upload PDF", type=['pdf'], key="pdf_uploader")
 
     if uploaded_file:
-        if st.button("Process PDF and Create Email Drafts"):
-            progress_bar = st.progress(0, "Starting processing...")
+        # Explicit key for the action button
+        if st.button("Process PDF and Create Email Drafts", key="process_button"):
+            # Progress bar with explicit key. Note: st.progress(value, text=...) newer API; for broad compat use 0 first then st.write text if needed.
+            progress_bar = st.progress(0, text="Starting processing...")
             with st.spinner("Processing PDF..."):
                 generated_files = process_pdf(uploaded_file, start_sequence, progress_bar)
                 if generated_files:
@@ -66,7 +82,7 @@ def main():
                         try:
                             # Create email template using extracted values
                             subject, body, html_body = create_settlement_template(
-                                file_info['currency'], 
+                                file_info['currency'],
                                 file_info['payment_total']
                             )
                             email_data = {
@@ -110,10 +126,8 @@ def main():
         st.subheader("Download by Currency")
         currency_files = {}
         for file in st.session_state.processed_files:
-            curr = file['currency']
-            if curr not in currency_files:
-                currency_files[curr] = []
-            currency_files[curr].append(file)
+            curr = file.get('currency', 'UNKNOWN')
+            currency_files.setdefault(curr, []).append(file)
         
         for currency, files in currency_files.items():
             st.write(f"\n{currency} Files:")
@@ -128,12 +142,16 @@ def main():
                 with cols[col_idx]:
                     # Create a container for consistent button styling
                     with st.container():
+                        # Derive a deterministic unique key per file
+                        fname = file_info['filename']
+                        # Key uses currency + filename to avoid collisions across groups
+                        dl_key = f"download_{stable_id(currency, fname)}"
                         st.download_button(
-                            label=file_info['filename'].replace('_order details.pdf', ''),
+                            label=fname.replace('_order details.pdf', ''),
                             data=file_info['content'],
-                            file_name=file_info['filename'],
+                            file_name=fname,
                             mime="application/pdf",
-                            key=f"download_{currency}_{idx}",
+                            key=dl_key,
                             use_container_width=True,
                         )
                         # Add some vertical spacing between rows
@@ -142,6 +160,7 @@ def main():
             
             # Add separator between currency groups
             st.markdown("---")
+
 
 if __name__ == "__main__":
     main()
