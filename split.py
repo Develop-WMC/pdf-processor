@@ -190,7 +190,7 @@ def get_gemini_response(image: Image.Image) -> Optional[dict]:
     """
     try:
         model = genai.GenerativeModel(
-            'gemini-2.5-flash',
+            'gemini-2.5-flash-lite',
             generation_config={
                 "temperature": 0,
                 "response_mime_type": "application/json"
@@ -392,4 +392,5 @@ with st.expander("1. PDF Processing", expanded=True):
                         st.write(f"{cur}: {amt:,.2f}")
             else:
                 st.info("No output files were generated.")
+
 
