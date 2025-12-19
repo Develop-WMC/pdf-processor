@@ -1,6 +1,7 @@
-# app.py
+# split.py
 # Streamlit PDF Processing with robust Gemini parsing and fallbacks
-# Fixes 'list' object has no attribute 'get' by normalizing AI output and adding text-based fallback.
+# Fixes 'list' object has no attribute 'get' by normalizing AI output.
+# Fixes 'FH' naming issue by stripping 'FH-' prefix.
 
 import os
 import io
@@ -71,13 +72,25 @@ SPECIAL_MAP = {
 }
 
 def simplify_from_full(full_name: str) -> str:
+    """
+    Logic to extract the Fund House name. 
+    Updated to strip 'FH-' prefix to avoid getting 'FH' as the name.
+    """
     if not full_name:
         return ""
+    
+    # 1. Check Special Map first
     for key, val in SPECIAL_MAP.items():
         if key in full_name:
             return val
-    # Rule: take text before the first dash, if any
-    return full_name.split('-', 1)[0].strip()
+    
+    # 2. Strip "FH-" if it exists at the start
+    clean_name = full_name.strip()
+    if clean_name.startswith("FH-"):
+        clean_name = clean_name[3:]
+        
+    # 3. Take text before the first remaining dash
+    return clean_name.split('-', 1)[0].strip()
 
 def normalize_ai_results(raw: Union[dict, list, str, None]) -> Optional[dict]:
     """
@@ -94,10 +107,8 @@ def normalize_ai_results(raw: Union[dict, list, str, None]) -> Optional[dict]:
                 return item
         return None
     if isinstance(raw, str):
-        # Sometimes the SDK returns .text containing JSON or fenced code
         s = raw.strip()
         if s.startswith("```"):
-            # strip code fences
             if "```json" in s:
                 s = s.split("```json", 1)[1]
             else:
@@ -148,10 +159,6 @@ def is_summary_page(text: str) -> bool:
     return False
 
 def fallback_extract_from_text(page_text: str, context: dict) -> Optional[dict]:
-    """
-    Fallback when model output is missing or incomplete.
-    Extracts currency and payment total via regex and reuses previous page's fund house if needed.
-    """
     data: dict = {}
 
     # Currency
@@ -161,14 +168,13 @@ def fallback_extract_from_text(page_text: str, context: dict) -> Optional[dict]:
     elif context.get("currency"):
         data["currency"] = context["currency"]
 
-    # Full name (Fund Hse Settlement Inst :)
+    # Full name
     mfull = re.search(r'Fund Hse Settlement Inst\s*:\s*(.+)', page_text)
     if mfull:
         full = mfull.group(1).strip()
         data["full_name"] = full
         data["simplified_name"] = simplify_from_full(full)
     else:
-        # Continuation page: carry forward
         if context.get("full_name"):
             data["full_name"] = context["full_name"]
         if context.get("simplified_name"):
@@ -185,9 +191,6 @@ def fallback_extract_from_text(page_text: str, context: dict) -> Optional[dict]:
     return None
 
 def get_gemini_response(image: Image.Image) -> Optional[dict]:
-    """
-    Ask Gemini to extract a single JSON object. Normalizes any list outputs.
-    """
     try:
         model = genai.GenerativeModel(
             'gemini-2.5-flash-lite',
@@ -209,9 +212,11 @@ Extract information from the document image and return ONE JSON OBJECT only (not
 
 Rules:
 1) Use the exact text after 'Fund Hse Settlement Inst :' as full_name.
-   When computing simplified_name, if full_name contains '-', keep only the part BEFORE the first '-',
-   unless any special mapping below applies.
-2) Special mappings (override simplified_name if applicable):
+2) When computing simplified_name:
+   - If full_name starts with "FH-", IGNORE the "FH-" part.
+   - Then, keep only the part BEFORE the next '-'.
+   - Example: "FH-MFEX-USD" becomes "MFEX". "FH-Mirae-USD" becomes "Mirae".
+3) Special mappings (override simplified_name if applicable):
    FH-CAPDYN:MF/BOC → CAPDYN
    FH-Mirae → Mirae
    FH-iFund → iFund
@@ -227,9 +232,9 @@ Rules:
    FH-Peak/Belgrave → Belgrave
    FH-Everbright/Broker → Everbright
    FH-NJ/ → Nanjia
-3) currency is the value in 'Currency :'.
-4) payment_total is the numeric string after 'Payment Group XXXX Total'.
-5) If the page is a continuation and 'Fund Hse Settlement Inst :' is not visible, infer from visible text and set confidence to LOW if uncertain.
+4) currency is the value in 'Currency :'.
+5) payment_total is the numeric string after 'Payment Group XXXX Total'.
+6) If the page is a continuation and 'Fund Hse Settlement Inst :' is not visible, infer from visible text.
 Return only the JSON object, no markdown or explanation.
         """.strip()
 
@@ -252,13 +257,10 @@ def process_pdf(uploaded_file, start_sequence: int, progress_bar) -> list:
         with open(temp_path, 'wb') as f:
             f.write(uploaded_file.getbuffer())
 
-        # Use both fitz (for text/image) and PyPDF2 (for page writing)
         doc = fitz.open(temp_path)
         reader = PdfReader(temp_path)
         sequence_number = start_sequence
         total_pages = len(doc)
-
-        # Context carries fund house and currency across continuation pages
         context = {"full_name": None, "simplified_name": None, "currency": None}
 
         for page_number in range(total_pages):
@@ -266,22 +268,18 @@ def process_pdf(uploaded_file, start_sequence: int, progress_bar) -> list:
             try:
                 progress_bar.progress(progress, text=f"Processing page {page_number + 1} of {total_pages}")
             except TypeError:
-                # Older Streamlit versions
                 progress_bar.progress(progress)
 
             page = doc[page_number]
             page_text = page.get_text()
 
-            # Skip summary/total page(s)
             if is_summary_page(page_text):
                 continue
 
-            # Try vision extraction first
             page_image = convert_pdf_to_image(temp_path, page_number)
             ai_results = get_gemini_response(page_image) if page_image is not None else None
             ai_results = normalize_ai_results(ai_results)
 
-            # Fallback to text parsing if needed
             if not ai_results or not all(
                 ai_results.get(k) for k in ("simplified_name", "currency", "payment_total")
             ):
@@ -291,12 +289,11 @@ def process_pdf(uploaded_file, start_sequence: int, progress_bar) -> list:
                 st.warning(f"Skipping page {page_number + 1}: could not extract required fields.")
                 continue
 
-            # Update context so continuation pages can reuse info
             context["full_name"] = ai_results.get("full_name") or context["full_name"]
             context["simplified_name"] = ai_results.get("simplified_name") or context["simplified_name"]
             context["currency"] = ai_results.get("currency") or context["currency"]
 
-            chosen_name = ai_results.get("simplified_name") or simplify_from_full(ai_results.get("full_name", ""))
+            chosen_name = ai_results.get("simplified_name")
             currency = ai_results.get("currency")
             payment_total = ai_results.get("payment_total")
 
@@ -306,7 +303,6 @@ def process_pdf(uploaded_file, start_sequence: int, progress_bar) -> list:
                 filename = f"S{date_str}-{str(sequence_number).zfill(2)}_{sanitized_name}_{currency}-order details.pdf"
                 output_path = os.path.join(OUTPUT_FOLDER, filename)
 
-                # Write a single-page PDF for this page
                 try:
                     pdf_writer = PdfWriter()
                     pdf_writer.add_page(reader.pages[page_number])
@@ -316,20 +312,16 @@ def process_pdf(uploaded_file, start_sequence: int, progress_bar) -> list:
                     st.error(f"Error writing output PDF for page {page_number + 1}: {str(e)}")
                     continue
 
-                # Convert payment_total to number if possible
                 try:
                     pay_num = Decimal(payment_total.replace(',', ''))
                 except Exception:
                     pay_num = None
 
-                with open(output_path, 'rb') as file:
-                    file_content = file.read()
-                    generated_files.append({
-                        'filename': filename,
-                        'content': file_content,
-                        'currency': currency,
-                        'payment_total': float(pay_num) if pay_num is not None else None
-                    })
+                generated_files.append({
+                    'filename': filename,
+                    'currency': currency,
+                    'payment_total': float(pay_num) if pay_num is not None else None
+                })
 
                 sequence_number += 1
 
@@ -351,7 +343,7 @@ def process_pdf(uploaded_file, start_sequence: int, progress_bar) -> list:
                 st.warning(f"Could not remove temporary file: {str(e)}")
 
 # ---------------------------
-# Simple UI
+# UI (Restored to original structure)
 # ---------------------------
 with st.expander("1. PDF Processing", expanded=True):
     last_used = st.number_input("Last sequence number used:", min_value=0, step=1, value=0)
@@ -370,7 +362,6 @@ with st.expander("1. PDF Processing", expanded=True):
 
             if results:
                 st.success(f"Generated {len(results)} file(s).")
-                # Show a quick summary
                 st.write([
                     {
                         "filename": r["filename"],
@@ -380,7 +371,6 @@ with st.expander("1. PDF Processing", expanded=True):
                     for r in results
                 ])
 
-                # Aggregate by currency
                 totals = {}
                 for r in results:
                     cur = r["currency"]
@@ -392,5 +382,3 @@ with st.expander("1. PDF Processing", expanded=True):
                         st.write(f"{cur}: {amt:,.2f}")
             else:
                 st.info("No output files were generated.")
-
-
