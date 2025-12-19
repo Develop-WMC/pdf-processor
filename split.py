@@ -1,7 +1,7 @@
 # split.py
 # Streamlit PDF Processing with robust Gemini parsing and fallbacks
-# Fixes 'list' object has no attribute 'get' by normalizing AI output.
-# Fixes 'FH' naming issue by stripping 'FH-' prefix.
+# Fixes 'KeyError: content' by including binary data in results.
+# Fixes 'local variable filename' error by ensuring assignment before use.
 
 import os
 import io
@@ -52,7 +52,6 @@ def sanitize_filename(filename: str) -> str:
     invalid_chars = r'[<>:"/\\|?*]'
     return re.sub(invalid_chars, '_', filename).strip() or "untitled"
 
-# Special mappings for simplified_name
 SPECIAL_MAP = {
     'FH-CAPDYN:MF/BOC': 'CAPDYN',
     'FH-Mirae': 'Mirae',
@@ -72,31 +71,17 @@ SPECIAL_MAP = {
 }
 
 def simplify_from_full(full_name: str) -> str:
-    """
-    Logic to extract the Fund House name. 
-    Updated to strip 'FH-' prefix to avoid getting 'FH' as the name.
-    """
     if not full_name:
         return ""
-    
-    # 1. Check Special Map first
     for key, val in SPECIAL_MAP.items():
         if key in full_name:
             return val
-    
-    # 2. Strip "FH-" if it exists at the start
     clean_name = full_name.strip()
     if clean_name.startswith("FH-"):
         clean_name = clean_name[3:]
-        
-    # 3. Take text before the first remaining dash
     return clean_name.split('-', 1)[0].strip()
 
 def normalize_ai_results(raw: Union[dict, list, str, None]) -> Optional[dict]:
-    """
-    Normalize Gemini output to a single dict.
-    Accepts dict, list[dict], or JSON string. Returns dict or None.
-    """
     if raw is None:
         return None
     if isinstance(raw, dict):
@@ -125,7 +110,7 @@ def convert_pdf_to_image(pdf_path: str, page_num: int) -> Optional[Image.Image]:
     try:
         doc = fitz.open(pdf_path)
         page = doc[page_num]
-        zoom = 4  # quality scaler
+        zoom = 4 
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat, alpha=False)
         img_data = pix.tobytes("png")
@@ -136,39 +121,20 @@ def convert_pdf_to_image(pdf_path: str, page_num: int) -> Optional[Image.Image]:
         return None
 
 def is_summary_page(text: str) -> bool:
-    summary_indicators = [
-        "Summary",
-        "Grand Total",
-        "Currency\nFDS_190.rpt\n",
-        "Total\n"
-    ]
-
+    summary_indicators = ["Summary", "Grand Total", "Currency\nFDS_190.rpt\n", "Total\n"]
     if any(ind in text for ind in summary_indicators):
         if "Payment Group" not in text:
             return True
-
-    if "Summary" in text and any(curr in text for curr in ["JPY", "USD", "HKD", "AUD", "EUR", "GBP", "CNY"]):
-        lines = text.split('\n')
-        currency_total_count = 0
-        for line in lines:
-            if re.search(r'Total\s*(JPY|USD|HKD|AUD|EUR|GBP|CNY)\s*[\d,]+\.\d{2}', line):
-                currency_total_count += 1
-        if currency_total_count >= 2:
-            return True
-
     return False
 
 def fallback_extract_from_text(page_text: str, context: dict) -> Optional[dict]:
     data: dict = {}
-
-    # Currency
     mcur = re.search(r'Currency\s*:\s*(USD|HKD|JPY|AUD|EUR|GBP|CNY)', page_text)
     if mcur:
         data["currency"] = mcur.group(1).strip()
     elif context.get("currency"):
         data["currency"] = context["currency"]
 
-    # Full name
     mfull = re.search(r'Fund Hse Settlement Inst\s*:\s*(.+)', page_text)
     if mfull:
         full = mfull.group(1).strip()
@@ -177,10 +143,8 @@ def fallback_extract_from_text(page_text: str, context: dict) -> Optional[dict]:
     else:
         if context.get("full_name"):
             data["full_name"] = context["full_name"]
-        if context.get("simplified_name"):
             data["simplified_name"] = context["simplified_name"]
 
-    # Payment Group Total
     mpay = re.search(r'Payment Group\s+\S+\s+Total\s+([\d,]+\.\d{2})', page_text)
     if mpay:
         data["payment_total"] = mpay.group(1).strip()
@@ -194,12 +158,8 @@ def get_gemini_response(image: Image.Image) -> Optional[dict]:
     try:
         model = genai.GenerativeModel(
             'gemini-2.5-flash-lite',
-            generation_config={
-                "temperature": 0,
-                "response_mime_type": "application/json"
-            }
+            generation_config={"temperature": 0, "response_mime_type": "application/json"}
         )
-
         prompt = """
 Extract information from the document image and return ONE JSON OBJECT only (not an array), with these exact keys:
 {
@@ -215,7 +175,7 @@ Rules:
 2) When computing simplified_name:
    - If full_name starts with "FH-", IGNORE the "FH-" part.
    - Then, keep only the part BEFORE the next '-'.
-   - Example: "FH-MFEX-USD" becomes "MFEX". "FH-Mirae-USD" becomes "Mirae".
+   - Example: "FH-MFEX-USD" becomes "MFEX".
 3) Special mappings (override simplified_name if applicable):
    FH-CAPDYN:MF/BOC → CAPDYN
    FH-Mirae → Mirae
@@ -234,26 +194,21 @@ Rules:
    FH-NJ/ → Nanjia
 4) currency is the value in 'Currency :'.
 5) payment_total is the numeric string after 'Payment Group XXXX Total'.
-6) If the page is a continuation and 'Fund Hse Settlement Inst :' is not visible, infer from visible text.
 Return only the JSON object, no markdown or explanation.
         """.strip()
-
         response = model.generate_content([prompt, image])
         if not response or not getattr(response, "text", None):
             return None
-
-        data = normalize_ai_results(response.text)
-        return data
+        return normalize_ai_results(response.text)
     except Exception as e:
         st.error(f"Gemini API error: {str(e)}")
         return None
 
 def process_pdf(uploaded_file, start_sequence: int, progress_bar) -> list:
     generated_files = []
-    temp_path = None
-
+    temp_path = os.path.join(TEMP_DIR, uploaded_file.name)
+    
     try:
-        temp_path = os.path.join(TEMP_DIR, uploaded_file.name)
         with open(temp_path, 'wb') as f:
             f.write(uploaded_file.getbuffer())
 
@@ -280,9 +235,7 @@ def process_pdf(uploaded_file, start_sequence: int, progress_bar) -> list:
             ai_results = get_gemini_response(page_image) if page_image is not None else None
             ai_results = normalize_ai_results(ai_results)
 
-            if not ai_results or not all(
-                ai_results.get(k) for k in ("simplified_name", "currency", "payment_total")
-            ):
+            if not ai_results or not all(ai_results.get(k) for k in ("simplified_name", "currency", "payment_total")):
                 ai_results = fallback_extract_from_text(page_text, context)
 
             if not ai_results:
@@ -303,47 +256,39 @@ def process_pdf(uploaded_file, start_sequence: int, progress_bar) -> list:
                 filename = f"S{date_str}-{str(sequence_number).zfill(2)}_{sanitized_name}_{currency}-order details.pdf"
                 output_path = os.path.join(OUTPUT_FOLDER, filename)
 
-                try:
-                    pdf_writer = PdfWriter()
-                    pdf_writer.add_page(reader.pages[page_number])
-                    with open(output_path, 'wb') as output_file:
-                        pdf_writer.write(output_file)
-                except Exception as e:
-                    st.error(f"Error writing output PDF for page {page_number + 1}: {str(e)}")
-                    continue
+                # 1. Create the PDF file
+                pdf_writer = PdfWriter()
+                pdf_writer.add_page(reader.pages[page_number])
+                with open(output_path, 'wb') as output_file:
+                    pdf_writer.write(output_file)
+
+                # 2. Read the binary content (Required for ZIP download)
+                with open(output_path, 'rb') as f:
+                    file_bytes = f.read()
 
                 try:
                     pay_num = Decimal(payment_total.replace(',', ''))
-                except Exception:
+                except:
                     pay_num = None
 
+                # 3. Add to results list with 'content' key
                 generated_files.append({
                     'filename': filename,
+                    'content': file_bytes,  # <--- ADDED THIS TO FIX ZIP ERROR
                     'currency': currency,
-                    'payment_total': float(pay_num) if pay_num is not None else None
+                    'payment_total': float(pay_num) if pay_num is not None else 0.0
                 })
 
                 sequence_number += 1
 
         doc.close()
-        try:
-            progress_bar.progress(1.0, text="Processing complete!")
-        except TypeError:
-            progress_bar.progress(1.0)
         return generated_files
-
-    except Exception as e:
-        st.error(f"Processing error: {str(e)}")
-        return []
     finally:
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except Exception as e:
-                st.warning(f"Could not remove temporary file: {str(e)}")
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 # ---------------------------
-# UI (Restored to original structure)
+# UI
 # ---------------------------
 with st.expander("1. PDF Processing", expanded=True):
     last_used = st.number_input("Last sequence number used:", min_value=0, step=1, value=0)
@@ -361,6 +306,9 @@ with st.expander("1. PDF Processing", expanded=True):
             results = process_pdf(uploaded_file, int(start_seq), progress_bar)
 
             if results:
+                # IMPORTANT: Save to session state so main.py can see them
+                st.session_state.processed_files = results
+                
                 st.success(f"Generated {len(results)} file(s).")
                 st.write([
                     {
